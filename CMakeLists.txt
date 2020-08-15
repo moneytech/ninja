@@ -1,12 +1,36 @@
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.15)
 project(ninja)
 
-if(MSVC)
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /GR- /Zc:__cplusplus")
-else()
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated -fdiagnostics-color")
+# --- optional link-time optimization
+if(CMAKE_BUILD_TYPE MATCHES "Release")
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT lto_supported OUTPUT error)
+
+	if(lto_supported)
+		message(STATUS "IPO / LTO enabled")
+		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+	else()
+		message(STATUS "IPO / LTO not supported: <${error}>")
+	endif()
 endif()
 
+# --- compiler flags
+if(MSVC)
+	set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+	string(APPEND CMAKE_CXX_FLAGS " /W4 /GR- /Zc:__cplusplus")
+else()
+	include(CheckCXXCompilerFlag)
+	check_cxx_compiler_flag(-Wno-deprecated flag_no_deprecated)
+	if(flag_no_deprecated)
+		string(APPEND CMAKE_CXX_FLAGS " -Wno-deprecated")
+	endif()
+	check_cxx_compiler_flag(-fdiagnostics-color flag_color_diag)
+	if(flag_color_diag)
+		string(APPEND CMAKE_CXX_FLAGS " -fdiagnostics-color")
+	endif()
+endif()
+
+# --- optional re2c
 find_program(RE2C re2c)
 if(RE2C)
 	# the depfile parser and ninja lexers are generated using re2c.
@@ -15,9 +39,9 @@ if(RE2C)
 			COMMAND ${RE2C} -b -i --no-generation-date -o ${OUT} ${IN}
 		)
 	endfunction()
-	re2c(${CMAKE_SOURCE_DIR}/src/depfile_parser.in.cc ${CMAKE_BINARY_DIR}/depfile_parser.cc)
-	re2c(${CMAKE_SOURCE_DIR}/src/lexer.in.cc ${CMAKE_BINARY_DIR}/lexer.cc)
-	add_library(libninja-re2c OBJECT ${CMAKE_BINARY_DIR}/depfile_parser.cc ${CMAKE_BINARY_DIR}/lexer.cc)
+	re2c(${PROJECT_SOURCE_DIR}/src/depfile_parser.in.cc ${PROJECT_BINARY_DIR}/depfile_parser.cc)
+	re2c(${PROJECT_SOURCE_DIR}/src/lexer.in.cc ${PROJECT_BINARY_DIR}/lexer.cc)
+	add_library(libninja-re2c OBJECT ${PROJECT_BINARY_DIR}/depfile_parser.cc ${PROJECT_BINARY_DIR}/lexer.cc)
 else()
 	message(WARNING "re2c was not found; changes to src/*.in.cc will not affect your build.")
 	add_library(libninja-re2c OBJECT src/depfile_parser.cc src/lexer.cc)
@@ -63,6 +87,11 @@ else()
 	target_sources(libninja PRIVATE src/subprocess-posix.cc)
 endif()
 
+#Fixes GetActiveProcessorCount on MinGW
+if(MINGW)
+target_compile_definitions(libninja PRIVATE _WIN32_WINNT=0x0601 __USE_MINGW_ANSI_STDIO=1)
+endif()
+
 # Main executable is library plus main() function.
 add_executable(ninja src/ninja.cc)
 target_link_libraries(ninja PRIVATE libninja libninja-re2c)
@@ -93,5 +122,19 @@ if(WIN32)
 endif()
 target_link_libraries(ninja_test PRIVATE libninja libninja-re2c)
 
+foreach(perftest
+  build_log_perftest
+  canon_perftest
+  clparser_perftest
+  depfile_parser_perftest
+  hash_collision_bench
+  manifest_parser_perftest
+)
+  add_executable(${perftest} src/${perftest}.cc)
+  target_link_libraries(${perftest} PRIVATE libninja libninja-re2c)
+endforeach()
+
 enable_testing()
 add_test(NinjaTest ninja_test)
+
+install(TARGETS ninja DESTINATION bin)

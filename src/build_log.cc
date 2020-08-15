@@ -21,7 +21,9 @@
 #endif
 
 #include "build_log.h"
+#include "disk_interface.h"
 
+#include <cassert>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +51,6 @@
 namespace {
 
 const char kFileSignature[] = "# ninja log v%d\n";
-const char kFileColumnLabels[] = "# start_time end_time mtime command hash\n";
 const int kOldestSupportedVersion = 4;
 const int kCurrentVersion = 5;
 
@@ -132,26 +133,9 @@ bool BuildLog::OpenForWrite(const string& path, const BuildLogUser& user,
       return false;
   }
 
-  log_file_ = fopen(path.c_str(), "ab");
-  if (!log_file_) {
-    *err = strerror(errno);
-    return false;
-  }
-  setvbuf(log_file_, NULL, _IOLBF, BUFSIZ);
-  SetCloseOnExec(fileno(log_file_));
-
-  // Opening a file in append mode doesn't set the file pointer to the file's
-  // end on Windows. Do that explicitly.
-  fseek(log_file_, 0, SEEK_END);
-
-  if (ftell(log_file_) == 0) {
-    if (fprintf(log_file_, kFileSignature, kCurrentVersion) < 0 ||
-        fprintf(log_file_, kFileColumnLabels) < 0) {
-      *err = strerror(errno);
-      return false;
-    }
-  }
-
+  assert(!log_file_);
+  log_file_path_ = path;  // we don't actually open the file right now, but will
+                          // do so on the first write attempt
   return true;
 }
 
@@ -175,6 +159,9 @@ bool BuildLog::RecordCommand(Edge* edge, int start_time, int end_time,
     log_entry->end_time = end_time;
     log_entry->mtime = mtime;
 
+    if (!OpenForWriteIfNeeded()) {
+      return false;
+    }
     if (log_file_) {
       if (!WriteEntry(log_file_, *log_entry))
         return false;
@@ -187,9 +174,34 @@ bool BuildLog::RecordCommand(Edge* edge, int start_time, int end_time,
 }
 
 void BuildLog::Close() {
+  OpenForWriteIfNeeded();  // create the file even if nothing has been recorded
   if (log_file_)
     fclose(log_file_);
   log_file_ = NULL;
+}
+
+bool BuildLog::OpenForWriteIfNeeded() {
+  if (log_file_path_.empty()) {
+    return true;
+  }
+  log_file_ = fopen(log_file_path_.c_str(), "ab");
+  if (!log_file_) {
+    return false;
+  }
+  setvbuf(log_file_, NULL, _IOLBF, BUFSIZ);
+  SetCloseOnExec(fileno(log_file_));
+
+  // Opening a file in append mode doesn't set the file pointer to the file's
+  // end on Windows. Do that explicitly.
+  fseek(log_file_, 0, SEEK_END);
+
+  if (ftell(log_file_) == 0) {
+    if (fprintf(log_file_, kFileSignature, kCurrentVersion) < 0) {
+      return false;
+    }
+  }
+  log_file_path_.clear();
+  return true;
 }
 
 struct LineReader {
@@ -243,14 +255,14 @@ struct LineReader {
   char* line_end_;
 };
 
-bool BuildLog::Load(const string& path, string* err) {
+LoadStatus BuildLog::Load(const string& path, string* err) {
   METRIC_RECORD(".ninja_log load");
   FILE* file = fopen(path.c_str(), "r");
   if (!file) {
     if (errno == ENOENT)
-      return true;
+      return LOAD_NOT_FOUND;
     *err = strerror(errno);
-    return false;
+    return LOAD_ERROR;
   }
 
   int log_version = 0;
@@ -271,7 +283,7 @@ bool BuildLog::Load(const string& path, string* err) {
         unlink(path.c_str());
         // Don't report this as a failure.  An empty build log will cause
         // us to rebuild the outputs anyway.
-        return true;
+        return LOAD_SUCCESS;
       }
     }
 
@@ -341,7 +353,7 @@ bool BuildLog::Load(const string& path, string* err) {
   fclose(file);
 
   if (!line_start) {
-    return true; // file was empty
+    return LOAD_SUCCESS; // file was empty
   }
 
   // Decide whether it's time to rebuild the log:
@@ -356,7 +368,7 @@ bool BuildLog::Load(const string& path, string* err) {
     needs_recompaction_ = true;
   }
 
-  return true;
+  return LOAD_SUCCESS;
 }
 
 BuildLog::LogEntry* BuildLog::LookupByOutput(const string& path) {
@@ -414,6 +426,63 @@ bool BuildLog::Recompact(const string& path, const BuildLogUser& user,
   }
 
   if (rename(temp_path.c_str(), path.c_str()) < 0) {
+    *err = strerror(errno);
+    return false;
+  }
+
+  return true;
+}
+
+bool BuildLog::Restat(const StringPiece path,
+                      const DiskInterface& disk_interface,
+                      const int output_count, char** outputs,
+                      std::string* const err) {
+  METRIC_RECORD(".ninja_log restat");
+
+  Close();
+  std::string temp_path = path.AsString() + ".restat";
+  FILE* f = fopen(temp_path.c_str(), "wb");
+  if (!f) {
+    *err = strerror(errno);
+    return false;
+  }
+
+  if (fprintf(f, kFileSignature, kCurrentVersion) < 0) {
+    *err = strerror(errno);
+    fclose(f);
+    return false;
+  }
+  for (Entries::iterator i = entries_.begin(); i != entries_.end(); ++i) {
+    bool skip = output_count > 0;
+    for (int j = 0; j < output_count; ++j) {
+      if (i->second->output == outputs[j]) {
+        skip = false;
+        break;
+      }
+    }
+    if (!skip) {
+      const TimeStamp mtime = disk_interface.Stat(i->second->output, err);
+      if (mtime == -1) {
+        fclose(f);
+        return false;
+      }
+      i->second->mtime = mtime;
+    }
+
+    if (!WriteEntry(f, *i->second)) {
+      *err = strerror(errno);
+      fclose(f);
+      return false;
+    }
+  }
+
+  fclose(f);
+  if (unlink(path.str_) < 0) {
+    *err = strerror(errno);
+    return false;
+  }
+
+  if (rename(temp_path.c_str(), path.str_) < 0) {
     *err = strerror(errno);
     return false;
   }

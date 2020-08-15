@@ -576,7 +576,7 @@ double GetLoadAverage() {
   // Calculation taken from comment in libperfstats.h
   return double(cpu_stats.loadavg[0]) / double(1 << SBITS);
 }
-#elif defined(__UCLIBC__)
+#elif defined(__UCLIBC__) || (defined(__BIONIC__) && __ANDROID_API__ < 29)
 double GetLoadAverage() {
   struct sysinfo si;
   if (sysinfo(&si) != 0)
@@ -596,6 +596,12 @@ double GetLoadAverage() {
 #endif // _WIN32
 
 string ElideMiddle(const string& str, size_t width) {
+  switch (width) {
+      case 0: return "";
+      case 1: return ".";
+      case 2: return "..";
+      case 3: return "...";
+  }
   const int kMargin = 3;  // Space for "...".
   string result = str;
   if (result.size() > width) {

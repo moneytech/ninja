@@ -21,6 +21,7 @@ using namespace std;
 
 #include <stdio.h>
 
+#include "load_status.h"
 #include "timestamp.h"
 
 struct Node;
@@ -84,7 +85,7 @@ struct DepsLog {
     int node_count;
     Node** nodes;
   };
-  bool Load(const string& path, State* state, string* err);
+  LoadStatus Load(const string& path, State* state, string* err);
   Deps* GetDeps(Node* node);
 
   /// Rewrite the known log entries, throwing away old data.
@@ -109,8 +110,13 @@ struct DepsLog {
   // Write a node name record, assigning it an id.
   bool RecordId(Node* node);
 
+  /// Should be called before using file_. When false is returned, errno will
+  /// be set.
+  bool OpenForWriteIfNeeded();
+
   bool needs_recompaction_;
   FILE* file_;
+  std::string file_path_;
 
   /// Maps id -> Node.
   vector<Node*> nodes_;

@@ -20,9 +20,11 @@
 using namespace std;
 
 #include "hash_map.h"
+#include "load_status.h"
 #include "timestamp.h"
 #include "util.h"  // uint64_t
 
+struct DiskInterface;
 struct Edge;
 
 /// Can answer questions about the manifest for the BuildLog.
@@ -43,13 +45,16 @@ struct BuildLog {
   BuildLog();
   ~BuildLog();
 
+  /// Prepares writing to the log file without actually opening it - that will
+  /// happen when/if it's needed
   bool OpenForWrite(const string& path, const BuildLogUser& user, string* err);
+
   bool RecordCommand(Edge* edge, int start_time, int end_time,
                      TimeStamp mtime = 0);
   void Close();
 
   /// Load the on-disk log.
-  bool Load(const string& path, string* err);
+  LoadStatus Load(const string& path, string* err);
 
   struct LogEntry {
     string output;
@@ -81,12 +86,21 @@ struct BuildLog {
   /// Rewrite the known log entries, throwing away old data.
   bool Recompact(const string& path, const BuildLogUser& user, string* err);
 
+  /// Restat all outputs in the log
+  bool Restat(StringPiece path, const DiskInterface& disk_interface,
+              int output_count, char** outputs, std::string* err);
+
   typedef ExternalStringHashMap<LogEntry*>::Type Entries;
   const Entries& entries() const { return entries_; }
 
  private:
+  /// Should be called before using log_file_. When false is returned, errno
+  /// will be set.
+  bool OpenForWriteIfNeeded();
+
   Entries entries_;
   FILE* log_file_;
+  std::string log_file_path_;
   bool needs_recompaction_;
 };
 
